@@ -19,6 +19,9 @@ pip install opencv-python mediapipe pygame
 python main.py
 ```
 
+## Demo
+![Demo](demo.gif)
+
 ## How control works
 - MediaPipe tracks shoulder/elbow/wrist and hip landmarks.
 - Arm level is computed from the arm-to-torso angle (lateral raises score higher).
