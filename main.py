@@ -4,57 +4,150 @@ import random
 import time
 
 import cv2
-import mediapipe as mp
+import numpy as np
 import pygame
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 
 class PoseController:
     def __init__(self, smooth_alpha=0.25):
-        self.pose = mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self.drawer = mp.solutions.drawing_utils
+        try:
+            base_options = python.BaseOptions(model_asset_path=self._get_model_path())
+            from mediapipe.tasks.python.vision.core import vision_task_running_mode as _rm
+            options = vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                running_mode=_rm.VisionTaskRunningMode.VIDEO,
+                output_segmentation_masks=False,
+            )
+            self.pose = vision.PoseLandmarker.create_from_options(options)
+        except FileNotFoundError:
+            print("Warning: Could not load pose model, downloading...")
+            # Download the model if not present
+            self._download_model()
+            base_options = python.BaseOptions(model_asset_path=self._get_model_path())
+            from mediapipe.tasks.python.vision.core import vision_task_running_mode as _rm
+            options = vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                running_mode=_rm.VisionTaskRunningMode.VIDEO,
+                output_segmentation_masks=False,
+            )
+            self.pose = vision.PoseLandmarker.create_from_options(options)
+        
         self.smooth_alpha = smooth_alpha
         self.filtered_level = 0.0
 
+    def _download_model(self):
+        """Download the PoseLandmarker model if needed."""
+        import urllib.request
+        model_path = self._get_model_path()
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        
+        model_url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+        try:
+            print(f"Downloading model to {model_path}...")
+            urllib.request.urlretrieve(model_url, model_path)
+            print("Model downloaded successfully")
+        except Exception as e:
+            print(f"Failed to download model: {e}")
+            # Fallback: use a lighter fallback approach
+            raise
+
+    def _get_model_path(self):
+        """Get the path to the PoseLandmarker model."""
+        import mediapipe
+        models_dir = os.path.join(
+            os.path.dirname(mediapipe.__file__),
+            "tasks", "python", "vision"
+        )
+        model_path = os.path.join(models_dir, "pose_landmarker_lite.task")
+        return model_path
+
     def process(self, frame_bgr):
+        # Convert to RGB numpy array for the pose landmarker.
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(frame_rgb)
+        # The Task API may expose different Image helpers across versions; use
+        # a robust fallback: if the landmarker supports `detect_for_video`
+        # (which accepts numpy arrays/frames), call it; otherwise try the
+        # `detect` path but construct a simple shim object.
+        results = None
+        try:
+            # Construct a mediapipe Image object from the core.image API
+            from mediapipe.tasks.python.vision.core import image as mp_image
+            mp_img = mp_image.Image(mp_image.ImageFormat.SRGB, frame_rgb)
+
+            # Prefer positional timestamp for detect_for_video (APIs vary).
+            if hasattr(self.pose, "detect_for_video"):
+                try:
+                    results = self.pose.detect_for_video(mp_img, int(time.time() * 1000))
+                except TypeError:
+                    # Some builds expect only the image argument.
+                    results = self.pose.detect_for_video(mp_img)
+            else:
+                results = self.pose.detect(mp_img)
+        except Exception:
+            # As a last resort, try passing raw numpy array to detect
+            try:
+                results = self.pose.detect(frame_rgb)
+            except Exception:
+                raise
         arm_level = 0.0
         detected = False
 
-        if results.pose_landmarks:
+        # Normalize access to pose landmarks depending on the API shape.
+        pose_landmarks = None
+        if results is None:
+            pose_landmarks = None
+        elif hasattr(results, "pose_landmarks") and results.pose_landmarks:
+            pose_landmarks = results.pose_landmarks
+        elif isinstance(results, (list, tuple)) and results:
+            # sometimes detect returns a list of detections
+            pose_landmarks = results[0].pose_landmarks if hasattr(results[0], 'pose_landmarks') else None
+
+        if pose_landmarks:
             detected = True
-            arm_level = self._arm_level_from_landmarks(results.pose_landmarks.landmark)
-            self.drawer.draw_landmarks(
-                frame_bgr,
-                results.pose_landmarks,
-                mp.solutions.pose.POSE_CONNECTIONS,
-            )
+            # pose_landmarks may be a wrapper; try to index it consistently
+            lm = pose_landmarks[0] if isinstance(pose_landmarks, (list, tuple)) else pose_landmarks
+            arm_level = self._arm_level_from_landmarks(lm)
+            try:
+                h, w = frame_bgr.shape[:2]
+                self._draw_landmarks(frame_bgr, lm, w, h)
+            except Exception:
+                pass
 
         self.filtered_level = (
             self.smooth_alpha * arm_level + (1.0 - self.smooth_alpha) * self.filtered_level
         )
         return frame_bgr, self.filtered_level, detected
 
+    def _draw_landmarks(self, image, landmarks, frame_width, frame_height):
+        """Draw pose landmarks on the image."""
+        # Draw connections (skeleton)
+        connections = [
+            (11, 13), (13, 15),  # Left arm
+            (12, 14), (14, 16),  # Right arm
+        ]
+        h, w = image.shape[:2]
+        for connection in connections:
+            start_idx, end_idx = connection
+            if start_idx < len(landmarks) and end_idx < len(landmarks):
+                start = landmarks[start_idx]
+                end = landmarks[end_idx]
+                if start.visibility > 0.5 and end.visibility > 0.5:
+                    x1, y1 = int(start.x * w), int(start.y * h)
+                    x2, y2 = int(end.x * w), int(end.y * h)
+                    cv2.line(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        
+        # Draw landmarks as circles
+        for i, landmark in enumerate(landmarks):
+            if landmark.visibility > 0.5:
+                x, y = int(landmark.x * w), int(landmark.y * h)
+                cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
+
     def _arm_level_from_landmarks(self, landmarks):
         sides = [
-            (
-                mp.solutions.pose.PoseLandmark.LEFT_SHOULDER,
-                mp.solutions.pose.PoseLandmark.LEFT_ELBOW,
-                mp.solutions.pose.PoseLandmark.LEFT_WRIST,
-                mp.solutions.pose.PoseLandmark.LEFT_HIP,
-            ),
-            (
-                mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER,
-                mp.solutions.pose.PoseLandmark.RIGHT_ELBOW,
-                mp.solutions.pose.PoseLandmark.RIGHT_WRIST,
-                mp.solutions.pose.PoseLandmark.RIGHT_HIP,
-            ),
+            (11, 13, 15, 23),  # Left shoulder, elbow, wrist, hip
+            (12, 14, 16, 24),  # Right shoulder, elbow, wrist, hip
         ]
         levels = []
         for shoulder_id, elbow_id, wrist_id, hip_id in sides:
