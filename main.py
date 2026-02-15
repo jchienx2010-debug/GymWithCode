@@ -203,31 +203,61 @@ class FlappyGame:
         pygame.init()
         self.width = width
         self.height = height
-        self.screen = pygame.display.set_mode((width, height))
+        self.is_fullscreen = False
+        self.screen = pygame.display.set_mode((width, height), pygame.RESIZABLE)
         pygame.display.set_caption("Pose Flappy Bird")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("arial", 24)
-        self.bird_frames = self._load_bird_frames()
         self.bird_frame_index = 0
         self.bird_anim_time = 0.0
         self.bird_anim_fps = 10.0
         self.flap_cooldown = 0.22
+        self._update_scale()  # This will also load bird frames
         self.reset()
 
+    def _update_scale(self):
+        """Update scaled values based on current screen dimensions."""
+        # Scale relative to 640x480 base resolution
+        scale_x = self.width / 640.0
+        scale_y = self.height / 480.0
+        self.scale = min(scale_x, scale_y)
+        
+        # Update font size based on scale
+        font_size = max(int(24 * self.scale), 12)
+        self.font = pygame.font.SysFont("arial", font_size)
+        
+        # Scaled game parameters
+        self.bird_x_base = 120
+        self.pipe_gap_base = 160
+        self.pipe_width_base = 70
+        self.pipe_spacing_base = 320
+        self.pipe_speed_base = 120.0
+        self.gravity_base = 470.0
+        self.flap_strength_base = 300.0
+        
+        self.bird_x = self.bird_x_base * scale_x
+        self.pipe_gap = self.pipe_gap_base * scale_y
+        self.pipe_width = self.pipe_width_base * scale_x
+        self.pipe_spacing = self.pipe_spacing_base * scale_x
+        self.pipe_speed = self.pipe_speed_base * scale_x
+        self.gravity = self.gravity_base * scale_y
+        self.flap_strength = self.flap_strength_base * scale_y
+        
+        # Scaled bird size
+        self.bird_width = int(48 * scale_x)
+        self.bird_height = int(36 * scale_y)
+        self.bird_half_width = self.bird_width // 2
+        self.bird_half_height = self.bird_height // 2
+        
+        # Reload bird frames at new size
+        self.bird_frames = self._load_bird_frames()
+
     def reset(self):
-        self.bird_x = 120
         self.bird_y = self.height / 2
         self.bird_vel = 0.0
         self.bird_frame_index = 0
         self.bird_anim_time = 0.0
         self.last_flap_time = 0.0
-        self.gravity = 470.0
-        self.flap_strength = 300.0
         self.pipes = []
-        self.pipe_gap = 160
-        self.pipe_width = 70
-        self.pipe_spacing = 320
-        self.pipe_speed = 120.0
         self.last_pipe_x = self.width
         self.game_over = False
         self.game_over_time = 0.0
@@ -267,11 +297,18 @@ class FlappyGame:
         self.pipes = [p for p in self.pipes if p["x"] > -self.pipe_width]
 
         if not self.pipes or self.pipes[-1]["x"] < self.width - self.pipe_spacing:
-            gap_y = random.randint(140, self.height - 140)
+            # Scale the margin based on screen height
+            margin = int(140 * (self.height / 480.0))
+            gap_y = random.randint(margin, self.height - margin)
             self.pipes.append({"x": self.width + 40, "gap_y": gap_y})
 
     def _check_collisions(self):
-        bird_rect = pygame.Rect(self.bird_x - 18, self.bird_y - 14, 36, 28)
+        bird_rect = pygame.Rect(
+            self.bird_x - self.bird_half_width, 
+            self.bird_y - self.bird_half_height, 
+            self.bird_width, 
+            self.bird_height
+        )
         if self.bird_y < 0 or self.bird_y > self.height:
             self._trigger_game_over()
             return
@@ -290,6 +327,28 @@ class FlappyGame:
         if not self.game_over:
             self.game_over = True
             self.game_over_time = time.time()
+
+    def toggle_fullscreen(self):
+        """Toggle between fullscreen and windowed mode."""
+        self.is_fullscreen = not self.is_fullscreen
+        if self.is_fullscreen:
+            # Use borderless window at screen resolution instead of exclusive fullscreen
+            # This allows window switching (Alt-Tab/Cmd-Tab) and multi-monitor support
+            info = pygame.display.Info()
+            self.width = info.current_w
+            self.height = info.current_h
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.NOFRAME)
+        else:
+            self.width = 640
+            self.height = 480
+            self.screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
+        
+        # Update scaled values for new dimensions
+        self._update_scale()
+        # Adjust bird position for new screen size
+        if hasattr(self, 'bird_y'):
+            # Keep bird at same relative position
+            self.bird_y = min(self.bird_y, self.height - 50)
 
     def draw(self, arm_level):
         self.screen.fill((60, 180, 210))
@@ -328,7 +387,12 @@ class FlappyGame:
             self.screen.blit(frame, rect.topleft)
         else:
             pygame.draw.ellipse(
-                self.screen, (250, 230, 50), (self.bird_x - 18, self.bird_y - 14, 36, 28)
+                self.screen, 
+                (250, 230, 50), 
+                (self.bird_x - self.bird_half_width, 
+                 self.bird_y - self.bird_half_height, 
+                 self.bird_width, 
+                 self.bird_height)
             )
 
     def _load_bird_frames(self):
@@ -340,7 +404,8 @@ class FlappyGame:
             if not os.path.exists(path):
                 continue
             image = pygame.image.load(path).convert_alpha()
-            image = pygame.transform.smoothscale(image, (48, 36))
+            # Use scaled bird dimensions
+            image = pygame.transform.smoothscale(image, (self.bird_width, self.bird_height))
             frames.append(image)
         return frames
 
@@ -350,12 +415,17 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam.")
 
+    # Create camera window first
+    cv2.namedWindow("Pose Control", cv2.WINDOW_NORMAL)
+    
     pose = PoseController(smooth_alpha=0.3)
+    # Create game window second so it appears on top
     game = FlappyGame()
     flap_threshold = 0.8
     flap_reset = 0.6
     flap_armed = True
     running = True
+    camera_fullscreen = False
 
     while running:
         ok, frame = cap.read()
@@ -384,13 +454,32 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_f:
+                    game.toggle_fullscreen()
+            elif event.type == pygame.VIDEORESIZE:
+                # Handle window resize
+                game.width = event.w
+                game.height = event.h
+                game.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                game._update_scale()
+                # Adjust bird position to stay within bounds
+                if hasattr(game, 'bird_y'):
+                    game.bird_y = min(game.bird_y, game.height - 50)
 
         game.tick(arm_level if detected else 0.0, flap)
         game.draw(arm_level if detected else 0.0)
 
         cv2.imshow("Pose Control", annotated)
-        if cv2.waitKey(1) & 0xFF == 27:
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC key
             running = False
+        elif key == ord('f') or key == ord('F'):  # F key for camera fullscreen
+            camera_fullscreen = not camera_fullscreen
+            if camera_fullscreen:
+                cv2.setWindowProperty("Pose Control", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            else:
+                cv2.setWindowProperty("Pose Control", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
 
     cap.release()
     cv2.destroyAllWindows()
